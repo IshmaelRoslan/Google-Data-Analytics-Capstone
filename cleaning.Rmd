@@ -1,0 +1,321 @@
+---
+title: "Bellabeat Exploratory Data Analysis"
+author: "Ishmael Roslan"
+date: "`r Sys.Date()`"
+output: 
+  rmdformats::downcute:
+                downcute_theme: chaos
+                df_print: paged
+                code_folding: show
+                lightbox: true
+                gallery: true
+                fig_caption: true
+                css: custom.css
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, cache = TRUE,
+                      message = FALSE, echo = TRUE,
+                      fig.align = 'center',
+                      fig.width = 10)
+```
+
+## Data Import and Wrangling {.tabset}
+
+### Setup Libraries
+
+```{r}
+library(data.table)
+library(lubridate)
+```
+
+### Importing Data
+
+1.  List Files in Directory
+
+2.  Remove `hourly` and `Wide` tables as they they are replicated in `minute` and `Narrow` tables respectively. `` dailyCalories, `dailySteps` `` and `dailyIntensities` are also duplicated in `dailyActivity`.
+
+    ```{r}
+    files <- list.files(path = "data", full.names = T)
+    files
+    files <-files[grep("(hourly|dailyA|weight|sleepD|minuteS|heart)", files, invert = FALSE)]
+    ```
+
+3.  Extract Table Names from path
+
+4.  Read in all files to a list of tables
+
+5.  Assign each table as a separate variable
+
+```{r}
+tablenames <- gsub("(.*/)(.*)(_.*)", r"(\2)", files)
+l <- lapply(files, fread, sep = ",", na.strings = c(""))
+for (row in 1:length(tablenames)) {
+  assign(tablenames[row], l[[row]])
+}
+str(l)
+```
+
+### Cleaning Data
+
+Parse DateTimes. Delay converting `Id` to factor until tables are joined.
+
+```{r}
+# Daily Data
+dailyActivity[, Date := mdy(ActivityDate)][, ActivityDate := NULL]
+sleepDay[, Date := date(mdy_hms(SleepDay))][, SleepDay := NULL]
+weightLogInfo[, Date := date(mdy_hms(Date))]
+# dailyActivity[, Date := as.POSIXct(ActivityDate)][, ActivityDate := NULL]
+# sleepDay[, Date := as.POSIXct(SleepDay)][, SleepDay := NULL]
+# weightLogInfo[, Date := as.POSIXct(Date)]
+
+# Minute Data
+minuteCaloriesNarrow[,DateTime := mdy_hms(ActivityMinute)][,ActivityMinute := NULL]
+minuteIntensitiesNarrow[, DateTime := mdy_hms(ActivityMinute)][,ActivityMinute := NULL]
+minuteMETsNarrow[,DateTime := mdy_hms(ActivityMinute)][
+,ActivityMinute := NULL]
+minuteSleep[, DateTime := mdy_hms(date)][,date := NULL]
+minuteStepsNarrow[, DateTime := mdy_hms(ActivityMinute)][,ActivityMinute := NULL]
+
+# Seconds Data
+heartrate_seconds[, DateTime := mdy_hms(Time)][,Time := NULL]
+setnames(heartrate_seconds, old = "Value", new = "Heartrate")
+```
+### Sleep
+```{r}
+setnames(minuteSleep, "value", "sleepType")
+sleep <- subset(minuteSleep[, `:=`(sleep_start = min(DateTime),
+                            sleep_end = max(DateTime)),
+                     by = .(Id, logId)][,sleepType := NULL],
+                DateTime == sleep_start)
+
+sleep[,`:=`(sleep_length = sleep_end - sleep_start,
+            Date = date(DateTime))][,DateTime:=NULL]
+
+sleep[,`:=`(sleep_start = hour(sleep_start),
+            sleep_length = as.numeric(sleep_length, units="hours"))][,sleep_end := NULL]
+
+sleep[, max_sleep_length := max(sleep_length), .(Date, Id)]
+sleep
+setkeyv(sleep, c("Id", "Date"))
+```
+### Data Merge
+
+Set Keys for each datatable for speed and then merge all tables with 1325580 rows as activity. Parse DateTime for easier analysis.
+
+```{r}
+# Daily Keys
+setkeyv(dailyActivity, c("Id", "Date"))
+setkeyv(sleepDay, c("Id", "Date"))
+setkeyv(weightLogInfo, c("Id", "Date"))
+
+# Minute Keys
+setkeyv(minuteCaloriesNarrow, c("Id", "DateTime"))
+setkeyv(minuteIntensitiesNarrow, c("Id", "DateTime"))
+setkeyv(minuteMETsNarrow, c("Id", "DateTime"))
+setkeyv(minuteSleep, c("Id", "DateTime"))
+setkeyv(minuteStepsNarrow, c("Id", "DateTime"))
+```
+
+
+Merging Daily- and Minute- Level Data and tidying the Environment
+
+```{r}
+daily <- weightLogInfo[sleep][sleepDay][dailyActivity]
+
+minute <- minuteSleep[minuteCaloriesNarrow][minuteIntensitiesNarrow][minuteMETsNarrow][minuteStepsNarrow]
+
+
+rm(list=ls()[! ls() %in% c("daily","minute")])
+```
+
+## Feature Engineering
+
+```{r eval = FALSE}
+daily[,`:=`(Date = date(DateTime),
+            Time = hms::as_hms(DateTime),
+            Day = wday(DateTime, label = TRUE),
+            Hour = hour(DateTime))]
+```
+
+
+
+### User Type {.tabset}
+
+I would be good to split the users into groups based on their Activity. I shall use k-means clustering to group the users
+
+#### Normalisation
+
+Select only the Activity Columns and then center and scale the data.
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+activity <-
+  daily %>%
+  select(c(VeryActiveMinutes:SedentaryMinutes)) %>%
+  mutate(across(.fns=scale))
+```
+
+#### Try k = 3 : 7
+
+```{r}
+set.seed(1234)
+
+kclusts <-
+  tibble(k = 3:6) %>%
+  mutate(
+    kclust = map(k, ~kmeans(activity, .x)),
+    tidied = map(kclust, tidy),
+    glanced = map(kclust, glance),
+    augmented = map(kclust, augment, activity)
+    )
+
+clusters <- 
+  kclusts %>%
+  unnest(cols = c(tidied))
+
+assignments <- 
+  kclusts %>% 
+  unnest(cols = c(augmented))
+
+clusterings <- 
+  kclusts %>%
+  unnest(cols = c(glanced))
+```
+
+```{r fig.cap = "k = 3 appears to give the most coherent clusters in terms of user activity."}
+assignments %>%
+  select(-c(kclust, tidied,glanced)) %>%
+  group_by(k, .cluster) %>%
+  mutate(.cluster = fct_reorder(.cluster, VeryActiveMinutes)) %>%
+  summarise(across(where(is.numeric), mean)) %>%
+  pivot_longer(c(VeryActiveMinutes:SedentaryMinutes), names_to = "Lifestyle", values_to = "Minutes") %>%
+  mutate(Lifestyle = fct_relevel(Lifestyle, c("SedentaryMinutes", "LightlyActiveMinutes", "FairlyActiveMinutes", "VeryActiveMinutes"))) %>%
+  ggplot(aes(fill= .cluster, y = Minutes, x = .cluster)) +
+  geom_col(position = "dodge") +
+  facet_grid(k~Lifestyle)
+```
+
+#### Map Cluster to UserType
+
+Double check that the Lifestyle assignments make sense.
+
+```{r}
+lifs <- assignments %>%
+  filter(k == 3) %>%
+  select(-c(k, kclust, tidied,glanced)) %>%
+  mutate(.cluster = fct_reorder(.cluster, (VeryActiveMinutes+FairlyActiveMinutes))) %>%
+  pull(.cluster)
+
+daily <- daily %>%
+  mutate(
+    Lifestyle = lifs,
+    Lifestyle = fct_recode(Lifestyle,
+                           "Sedentary" = "1",
+                           "Fairly Active" = "2",
+                           "Very Active" = "3")
+  )
+daily %>%
+  select(c(VeryActiveMinutes:SedentaryMinutes),Lifestyle) %>%
+  group_by(Lifestyle) %>%
+  summarise(across(where(is.numeric), mean)) %>%
+  arrange(VeryActiveMinutes + FairlyActiveMinutes)
+```
+
+## Data Summary {.tabset}
+
+Lets take a look at the cleaned and tidied data.
+
+### Daily
+
+```{r}
+skimr::skim(daily)
+```
+
+### Minute
+
+```{r}
+skimr::skim(minute)
+```
+
+## Feature Usage {.tabset}
+
+1\. What are some trends in smart device usage?
+
+```{r}
+library(ggplot2)
+library(gridExtra)
+library(plotly)
+```
+
+### Days Worn
+
+How many days did each user wear the tracker? Let's assume that if `Calories` \>0 then the tracker was worn.
+
+```{r fig.cap = "Most users wore the device for 30-32 out of the 32 days measured. After 2 weeks, usage began to drop off."}
+df <- daily[Calories > 0,.N,by = .(Date)]
+p1 <-
+  ggplot(data = df, aes(x = N)) +
+  stat_ecdf(geom = "point") +
+  labs(x = "Number of Days Worn",
+       y = "Percentage of Users") +
+  scale_y_continuous(labels =  scales::percent_format()) +
+  theme_bw()
+
+p2 <-
+  ggplot(data = df, aes(x = `Date`, y = N)) +
+  geom_line(size = 1) +
+  labs(x = "Date", y = "Number of Users") +
+  theme_bw()
+
+grid.arrange(p1,p2, nrow = 1)
+```
+
+### Weight Tracking
+
+Lets investigate the number of users who logged their weight;
+
+```{r fig.cap = "5/33 users logged their weight."}
+df <- daily[!is.na(WeightKg), .N, by = .(Date, Id)]
+ggplotly(
+  ggplot(data = df, aes(x = Date, y = N, fill = factor(Id))) +
+  geom_col(show.legend = FALSE) +
+  labs(x = "Date", y = "User") +
+  theme_minimal()
+)
+```
+
+One user logged almost every day.
+
+#### Steps
+
+```{r fig.cap = "5/33 users logged their weight."}
+df <- daily[!is.na(TotalSteps),.(Date, TotalSteps)][,TotalSteps := mean(TotalSteps),.(Date)]
+ggplotly(
+  ggplot(data = df, aes(x = Date, y = TotalSteps)) +
+  geom_line() +
+  labs(x = "Date", y = "Daily Steps") +
+  theme_minimal()
+)
+```
+
+#### Sleep
+
+```{r fig.cap = "5/33 users logged their weight."}
+ggplot(sleep, aes(x = sleep_start, y = sleep_length, group = sleep_start)) +
+  geom_violin() +
+  geom_jitter(aes(color = factor(Id)), show.legend = FALSE) +
+  theme_minimal()
+```
+
+```{r}
+daily %>%
+  select(Id, Calories, TotalMinutesAsleep, sleep_start) %>%
+  ggplot(aes(x = sleep_start, y = Calories, group = sleep_start)) +
+  geom_boxplot()
+
+```
+
